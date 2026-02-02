@@ -5,7 +5,7 @@ const sleep = promisify(setTimeout);
 const CONFIG = {
     SCAN_DURATION_MS: 4000,
     RECONNECT_DELAY_MS: 5000,
-    HEART_BEAT_INTERVAL_MS: 20000,
+    HEART_BEAT_INTERVAL_MS: 15000,
     GATT_WAIT_MS: 2000,
     WRITE_RETRY_COUNT: 3,
     AUTO_OFF_MS: 1500,
@@ -125,16 +125,8 @@ class PushBotAccessory {
             try {
                 this.notifyChar = await service.getCharacteristic(this.notifyUuid);
                 await this.notifyChar.startNotifications();
-
-                this.heartbeatTimer = setInterval(async () => {
-                    if (this.isConnected) {
-                        try {
-                            await this.notifyChar.readValue();
-                        } catch (e) {}
-                    }
-                }, CONFIG.HEART_BEAT_INTERVAL_MS);
-
-                this.log.info(`[${this.name}] 하트비트 활성화 (간격: ${CONFIG.HEART_BEAT_INTERVAL_MS}ms)`);
+                this.startHeartbeat();
+                this.log.debug(`[${this.name}] 하트비트 활성화 (간격: ${CONFIG.HEART_BEAT_INTERVAL_MS}ms)`);
             } catch (e) {
                 this.log.warn(`[${this.name}] 하트비트 설정 건너뜀`);
             }
@@ -164,22 +156,28 @@ class PushBotAccessory {
                 await this.connectDevice();
             }
 
-            this.log.info(`[${this.name}] 명령 전송 중...`);
+            if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+            this.log.info(`[${this.name}] 명령 전송 준비 중 (Packet: ${this.config.push_packet_hex})`);
+            await sleep(300);
+
             let success = false;
             for (let i = 0; i < CONFIG.WRITE_RETRY_COUNT; i++) {
                 try {
-                    await this.writeChar.writeValue(this.pushCommand, { type: 'command' });
+                    await this.writeChar.writeValue(this.pushCommand, { type: 'request' });
                     success = true;
                     break;
                 } catch (err) {
+                    this.log.warn(`[${this.name}] 전송 실패 재시도 (${i+1}): ${err.message}`);
                     await sleep(500);
                 }
             }
 
             if (success) {
-                this.log.info(`[${this.name}] 작동 성공`);
+                this.log.info(`[${this.name}] 작동 명령 전송 완료.`);
                 this.isSwitchOn = true;
             }
+
+            this.startHeartbeat();
         } catch (e) {
             this.log.error(`[${this.name}] 제어 실패: ${e.message}`);
         }
@@ -188,6 +186,17 @@ class PushBotAccessory {
             this.isSwitchOn = false;
             this.switchService.updateCharacteristic(Characteristic.On, false);
         }, CONFIG.AUTO_OFF_MS);
+    }
+
+    startHeartbeat() {
+        if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        this.heartbeatTimer = setInterval(async () => {
+            if (this.isConnected && this.notifyChar) {
+                try {
+                    await this.notifyChar.readValue();
+                } catch (e) {}
+            }
+        }, CONFIG.HEART_BEAT_INTERVAL_MS);
     }
 
     getServices() {
