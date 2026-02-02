@@ -1,0 +1,35 @@
+{
+  "name": "homebridge-pushbot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "engines": {
+    "homebridge": ">=1.0.0",
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "homebridge",
+    "homebridge-plugin",
+    "homebridge-accessory",
+    "bluetooth",
+    "pushbot",
+    "ble"
+  ],
+  "homebridge": {
+    "platforms": [
+      {
+        "platform": "PushBot Platform",
+        "name": "Pushbot"
+      }
+    ]
+  },
+  "dependencies": {
+    "node-ble": "^1.13.0"
+  },
+  "peerDependencies": {
+    "homebridge": ">=1.0.0"
+  },
+  "devDependencies": {
+    "homebridge": ">=1.0.0"
+  }
+}
