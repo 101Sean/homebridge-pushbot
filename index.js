@@ -4,7 +4,6 @@ const sleep = promisify(setTimeout);
 
 const CONFIG = {
     SCAN_DURATION_MS: 4000,
-    RECONNECT_DELAY_MS: 20000,
     CONNECT_TIMEOUT_MS: 7000,
     GATT_TIMEOUT_MS: 10000,
     DISCONNECT_TIMEOUT_MS: 2000,
@@ -37,12 +36,11 @@ class PushBotPlatform {
                 !deviceConfig.write_uuid ||
                 !deviceConfig.notify_uuid ||
                 !deviceConfig.push_packet_base64) {
-                this.log.error(`[Config] 기기 "${deviceConfig.name || '이름없음'}"의 필수 항목(mac_address, service_uuid, write_uuid, notify_uuid, push_packet_base64)이 누락되어 건너뜁니다.`);
+                this.log.error(`[Config] "${deviceConfig.name || '이름없음'}" 필수 항목 누락`);
                 continue;
             }
 
             this.log.info(`기기 등록 중: ${deviceConfig.name}`);
-
             const uuid = this.api.hap.uuid.generate(deviceConfig.mac_address);
             const accessory = new this.api.platformAccessory(deviceConfig.name, uuid);
             new PushBotAccessory(this.log, deviceConfig, this, accessory);
@@ -63,16 +61,14 @@ class PushBotAccessory {
         this.serviceUuid = (config.service_uuid || '').toLowerCase();
         this.writeUuid = (config.write_uuid || '').toLowerCase();
         this.notifyUuid = (config.notify_uuid || '').toLowerCase();
-
-        // Base64 패킷
         this.pushCommand = Buffer.from(config.push_packet_base64, 'base64');
-
-        // 인증 패킷
+        this.useAuth = config.use_auth === true;   // 인증 패킷 사용 여부
         this.authPacket = Buffer.from([0x66, 0x39]);
 
-        this.isConnected = false;
         this.isSwitchOn = false;
-        this.abortCount = 0;
+        this.adapter = null;
+        this.device = null;
+        this.connectionLock = false;   // 중복 실행 방지
 
         this.initService();
         this.initNodeBle();
@@ -82,7 +78,6 @@ class PushBotAccessory {
         const { Service, Characteristic } = this.platform;
 
         this.switchService = this.accessory.getService(Service.Switch) || this.accessory.addService(Service.Switch, this.name);
-
         this.infoService = this.accessory.getService(Service.AccessoryInformation)
             .setCharacteristic(Characteristic.Manufacturer, 'SwitchBot')
             .setCharacteristic(Characteristic.Model, 'Push Mini')
@@ -97,7 +92,7 @@ class PushBotAccessory {
         try {
             const { bluetooth } = NodeBle.createBluetooth();
             this.adapter = await bluetooth.defaultAdapter();
-            this.startScanningLoop();
+            this.log.info(`[${this.name}] BLE 어댑터 준비 완료`);
         } catch (e) {
             this.log.error(`[BLE] 초기화 실패: ${e.message}`);
         }
@@ -110,150 +105,92 @@ class PushBotAccessory {
         return Promise.race([promise, timeout]);
     }
 
-    async startScanningLoop() {
-        while (true) {
-            if (!this.isConnected) {
-                try {
-                    this.log.info(`[${this.name}] 주변 기기 스캔 중...`);
-                    try { await this.adapter.stopDiscovery(); } catch(e) {}
-                    // UUID 필터로 원하는 서비스만 스캔
-                    await this.adapter.startDiscovery({
-                        uuids: [this.serviceUuid.replace(/-/g, '')]
-                    });
-                    await sleep(CONFIG.SCAN_DURATION_MS);
-                    await this.adapter.stopDiscovery();
-
-                    const devices = await this.adapter.devices();
-                    for (const addr of devices) {
-                        if (addr.toUpperCase().replace(/:/g, '') === this.macAddress.toUpperCase()) {
-                            this.device = await this.adapter.getDevice(addr);
-                            await this.connectDevice();
-                            break;
-                        }
-                    }
-                } catch (e) {
-                    this.log.error(`[BLE] 스캔 에러: ${e.message}`);
-                }
-            }
-            await sleep(CONFIG.RECONNECT_DELAY_MS);
-        }
-    }
-
-    async connectDevice() {
+    async findAndConnect() {
         try {
-            this.log.info(`[${this.name}] 연결 시도...`);
-            await this.withTimeout(this.device.connect(), CONFIG.CONNECT_TIMEOUT_MS, 'Device Connect');
-            this.isConnected = true;
-            this.log.info(`[${this.name}] 연결 성공`);
-
-            // 기존 disconnect 리스너 제거 후 새로 등록
-            this.device.removeAllListeners('disconnect');
-            this.device.once('disconnect', () => {
-                this.log.warn(`[${this.name}] 연결 유실 감지`);
-                this.cleanup();
+            await this.adapter.stopDiscovery().catch(() => {});
+            await this.adapter.startDiscovery({
+                uuids: [this.serviceUuid.replace(/-/g, '')]
             });
+            await sleep(CONFIG.SCAN_DURATION_MS);
+            await this.adapter.stopDiscovery();
 
-            await this.discoverCharacteristics();
-        } catch (e) {
-            if (e.message.includes('le-connection-abort-by-local')) {
-                this.abortCount++;
-                this.log.warn(`[BLE] 로컬 중단 에러 (${this.abortCount}/3)`);
-                if (this.abortCount >= 3) {
-                    this.resetBluetoothAdapter();
-                    this.abortCount = 0;
+            const devices = await this.adapter.devices();
+            for (const addr of devices) {
+                if (addr.toUpperCase().replace(/:/g, '') === this.macAddress.toUpperCase()) {
+                    this.device = await this.adapter.getDevice(addr);
+                    await this.withTimeout(this.device.connect(), CONFIG.CONNECT_TIMEOUT_MS, 'Device Connect');
+                    this.log.info(`[${this.name}] 연결 성공`);
+                    return true;
                 }
             }
-            this.cleanup();
+            this.log.warn(`[${this.name}] 기기를 찾지 못함`);
+            return false;
+        } catch (e) {
+            this.log.error(`[${this.name}] 연결 오류: ${e.message}`);
+            return false;
         }
     }
 
-    cleanup() {
-        this.isConnected = false;
+    async disconnectDevice() {
         if (this.device) {
-            this.withTimeout(this.device.disconnect(), CONFIG.DISCONNECT_TIMEOUT_MS, 'Disconnect').catch(() => {});
+            try {
+                await this.withTimeout(this.device.disconnect(), CONFIG.DISCONNECT_TIMEOUT_MS, 'Disconnect');
+            } catch (e) {}
             this.device = null;
         }
     }
 
-    resetBluetoothAdapter() {
-        this.log.warn(`[BLE] 블루투스 스택 리셋 시도...`);
-        const { exec } = require('child_process');
-        exec('sudo hciconfig hci0 down && sleep 1 && sudo hciconfig hci0 up', (error) => {
-            if (error) {
-                this.log.error(`[BLE] 어댑터 리셋 실패: ${error.message}`);
-            } else {
-                this.log.info(`[BLE] 블루투스 어댑터 재시작 완료`);
-            }
-        });
-    }
-
-    async discoverCharacteristics() {
-        try {
-            const gatt = await this.withTimeout(this.device.gatt(), CONFIG.GATT_TIMEOUT_MS, 'GATT Server');
-            await sleep(CONFIG.GATT_WAIT_MS);
-
-            const service = await this.withTimeout(
-                gatt.getPrimaryService(this.serviceUuid),
-                CONFIG.GATT_TIMEOUT_MS,
-                'Primary Service'
-            );
-
-            this.writeChar = await service.getCharacteristic(this.writeUuid);
-            this.notifyChar = await service.getCharacteristic(this.notifyUuid);
-
-            // 인증 패킷 전송
-            this.log.info(`[${this.name}] 인증 패킷 전송 (0x66 0x39)`);
-            await this.writeRaw(this.writeChar, this.authPacket);
-            await sleep(CONFIG.AUTH_WAIT_MS);
-
-            // Notify 리스너 등록 (연결 유지용, heartbeat X)
-            this.log.info(`[${this.name}] Notify 리스너 등록`);
-            await this.notifyChar.startNotifications();
-            this.notifyChar.on('valuechanged', (data) => {
-                // 상태 업데이트
-            });
-
-            this.log.info(`[${this.name}] 초기화 완료, 명령 대기 중`);
-        } catch (e) {
-            this.log.error(`[${this.name}] GATT 탐색 오류: ${e.message}`);
-            this.isConnected = false;
-            if (this.device) await this.device.disconnect().catch(() => {});
-        }
-    }
-
-    async writeRaw(characteristic, packet) {
-        if (!this.isConnected || !characteristic) return false;
-        for (let i = 0; i < CONFIG.WRITE_RETRY_COUNT; i++) {
-            try {
-                await characteristic.writeValue(packet, { type: 'command' });
-                return true;
-            } catch (e) {
-                this.log.warn(`[${this.name}] 쓰기 실패 (${i+1}/${CONFIG.WRITE_RETRY_COUNT}) - ${e.message}`);
-                await sleep(CONFIG.WRITE_DELAY_MS);
-            }
-        }
-        return false;
-    }
-
     async handleSetOn(value) {
         if (!value) return;
-
+        if (this.connectionLock) {
+            this.log.warn(`[${this.name}] 이미 명령 처리 중`);
+            return;
+        }
+        this.connectionLock = true;
         const { Characteristic } = this.platform;
 
         try {
-            if (!this.isConnected || !this.writeChar) {
-                this.log.info(`[${this.name}] 연결 없음 → 즉시 재연결 시도`);
-                await this.connectDevice();
+            const ok = await this.findAndConnect();
+            if (!ok) throw new Error('연결 실패');
+
+            const gatt = await this.withTimeout(this.device.gatt(), CONFIG.GATT_TIMEOUT_MS, 'GATT Server');
+            await sleep(CONFIG.GATT_WAIT_MS);
+            const service = await this.withTimeout(gatt.getPrimaryService(this.serviceUuid), CONFIG.GATT_TIMEOUT_MS, 'Primary Service');
+            const writeChar = await service.getCharacteristic(this.writeUuid);
+            const notifyChar = await service.getCharacteristic(this.notifyUuid);
+
+            if (this.useAuth) {
+                this.log.info(`[${this.name}] 인증 패킷 전송 (0x66 0x39)`);
+                await writeChar.writeValue(this.authPacket, { type: 'command' });
+                await sleep(CONFIG.AUTH_WAIT_MS);
             }
 
+            await notifyChar.startNotifications().catch(() => {});
+
             this.log.info(`[${this.name}] 명령 전송`);
-            const success = await this.writeRaw(this.writeChar, this.pushCommand);
+            let success = false;
+            for (let i = 0; i < CONFIG.WRITE_RETRY_COUNT; i++) {
+                try {
+                    await writeChar.writeValue(this.pushCommand, { type: 'command' });
+                    success = true;
+                    break;
+                } catch (e) {
+                    this.log.warn(`[${this.name}] 쓰기 재시도 (${i+1}/${CONFIG.WRITE_RETRY_COUNT})`);
+                    await sleep(CONFIG.WRITE_DELAY_MS);
+                }
+            }
+
             if (success) {
                 this.log.info(`[${this.name}] 작동 완료`);
                 this.isSwitchOn = true;
+            } else {
+                this.log.error(`[${this.name}] 명령 전송 실패`);
             }
         } catch (e) {
             this.log.error(`[${this.name}] 제어 오류: ${e.message}`);
+        } finally {
+            this.connectionLock = false;
+            setTimeout(() => this.disconnectDevice(), CONFIG.DISCONNECT_TIMEOUT_MS);
         }
 
         setTimeout(() => {
